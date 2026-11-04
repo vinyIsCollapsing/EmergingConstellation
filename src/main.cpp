@@ -1,18 +1,19 @@
 #include <Arduino.h>
 #include "MicrobitV2-HHS.h"
 #include "NRF52_Radio_library.h"
+#include "Adafruit_Microbit.h"
 
 // ==================================================
 //  LOG / DEBUG CONFIG
 //  1 = enabled, 0 = disabled
 // ==================================================
 #define ENABLE_SERIAL_LOG     1   // master switch: 0 disables all serial logging
-#define LOG_BOOT              1   // boot messages
+#define LOG_BOOT              0   // boot messages
 #define LOG_TX                1   // “TX: pulse sent...”
 #define LOG_RX                1   // periodic RX line (every LOG_EVERY_N_PULSES)
 #define LOG_NEIGHBORS         1   // neighbours table (periodic report)
-#define LOG_NEIGHBOR_EVENTS   1   // “New neighbour” and “Lost neighbour”
-#define LOG_GAPS              1   // “GAP from ...” (lost packets)
+#define LOG_NEIGHBOR_EVENTS   0   // “New neighbour” and “Lost neighbour”
+#define LOG_GAPS              0   // “GAP from ...” (lost packets)
 #define LOG_WARNINGS          1   // warnings (table full, drift out of range)
 #define DEBUG_RAW             0   // raw bytes received (verbose)
 
@@ -29,6 +30,7 @@ const unsigned long DEBOUNCE_MS = 30;
 #define RADIO_LEN       (PAYLOAD_LEN + MICROBIT_RADIO_HEADER_SIZE - 1) // = 9
 
 NRF52_Radio MicrobitRadio = NRF52_Radio();
+Adafruit_Microbit_Matrix matrix;
 
 // Radio config (must be the same in all boards)
 const int GROUP = 42;     // 0 - 255
@@ -64,6 +66,48 @@ unsigned long lastReportMs  = 0;
 int lastReading = HIGH;
 int stableState = HIGH;
 unsigned long lastChangeMs = 0;
+
+// --- Animation state ---
+enum AnimationType {ANIM_NONE, ANIM_TX, ANIM_RX};
+
+AnimationType currenteAnimation = ANIM_NONE;
+uint8_t animationFrame = 0;
+unsigned long lastFrameMs = 0;
+
+// --- TX Animation ---
+const uint8_t TX_FRAMES[][5] = {
+  {0b00000, 0b00000, 0b00100, 0b00000, 0b00000},
+  {0b00000, 0b00100, 0b01010, 0b00100, 0b00000},
+  {0b00100, 0b01010, 0b10001, 0b01010, 0b00100},
+  {0b01010, 0b10001, 0b00000, 0b10001, 0b01010}
+};
+
+// --- RX Animation ---
+const uint8_t RX_FRAMES[][5] = {
+  {0b01010, 0b10001, 0b00000, 0b10001, 0b01010},
+  {0b00100, 0b01010, 0b10001, 0b01010, 0b00100},
+  {0b00000, 0b00100, 0b01010, 0b00100, 0b00000},
+  {0b00000, 0b00000, 0b00100, 0b00000, 0b00000}
+};
+
+const uint8_t NUM_FRAMES = 4;
+const unsigned long FRAME_INTERVAL_MS = 80; // Frame duration
+
+// ==================================================
+// -------------- Function declaration --------------
+// ==================================================
+// Table management
+int findNeighbor(uint8_t _id);
+int freeSlot();
+void updateNeighbor(uint8_t _id, uint32_t _remoteTimestamp, int _rssi, unsigned long _now);
+void expireNeighbors(unsigned long _now);
+void printNeighborTable(unsigned long _now);
+// Radio
+void sendPulse();
+void handleReceive(unsigned long _now);
+// Animation
+void startAnimation(AnimationType _type);
+void updateAnimation();
 
 // ------ Table management ------
 
@@ -211,6 +255,7 @@ void printNeighborTable(unsigned long _now){
 
 // ------ Radio ------
 void sendPulse() {
+  startAnimation(ANIM_TX);
   FrameBuffer* myDataSent = new FrameBuffer();
   
   uint32_t timeStamp = millis();
@@ -262,10 +307,37 @@ void handleReceive(unsigned long _now) {
 
     if (id != MY_ID) {
       updateNeighbor(id, remoteTs, myDataReceived->rssi, _now);
+        startAnimation(ANIM_RX);
     }
   }
 
   delete myDataReceived;
+}
+
+// ---------- Animation ----------
+void startAnimation(AnimationType _type){
+  currenteAnimation = _type;
+  animationFrame = 0;
+  lastFrameMs = millis();
+}
+
+void updateAnimation(){
+  if(currenteAnimation == ANIM_NONE) return;
+
+  unsigned long now = millis();
+  if(now - lastFrameMs >= FRAME_INTERVAL_MS){
+    lastFrameMs = now;
+    animationFrame++;
+
+    if(animationFrame >= NUM_FRAMES){
+      matrix.clear();
+      currenteAnimation = ANIM_NONE;
+      return;
+    }
+
+    const uint8_t (*frames)[5] = (currenteAnimation == ANIM_TX) ? TX_FRAMES : RX_FRAMES;
+    matrix.show(frames[animationFrame]);
+  }
 }
 
 // Setup/Loop
@@ -281,6 +353,10 @@ void setup() {
   MicrobitRadio.setGroup(GROUP);
   MicrobitRadio.setFrequencyBand(BAND);
   MicrobitRadio.setTransmitPower(POWER);
+
+  // Matrix init
+  matrix.begin();
+  matrix.clear();
   
   for(int i = 0; i < MAX_NEIGHBORS; i++) neighbors[i].active = false;
 
@@ -318,6 +394,8 @@ void loop() {
   // Reception with a filter
   handleReceive(now);
   expireNeighbors(now);
+
+  updateAnimation();
 
   if(now - lastReportMs >= REPORT_INTERVAL_MS){
     lastReportMs = now;
