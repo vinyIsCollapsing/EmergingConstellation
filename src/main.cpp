@@ -2,13 +2,26 @@
 #include "MicrobitV2-HHS.h"
 #include "NRF52_Radio_library.h"
 
+// ==================================================
+//  LOG / DEBUG CONFIG
+//  1 = enabled, 0 = disabled
+// ==================================================
+#define ENABLE_SERIAL_LOG     1   // master switch: 0 disables all serial logging
+#define LOG_BOOT              1   // boot messages
+#define LOG_TX                1   // “TX: pulse sent...”
+#define LOG_RX                1   // periodic RX line (every LOG_EVERY_N_PULSES)
+#define LOG_NEIGHBORS         1   // neighbours table (periodic report)
+#define LOG_NEIGHBOR_EVENTS   1   // “New neighbour” and “Lost neighbour”
+#define LOG_GAPS              1   // “GAP from ...” (lost packets)
+#define LOG_WARNINGS          1   // warnings (table full, drift out of range)
+#define DEBUG_RAW             0   // raw bytes received (verbose)
+
 #define PIN_BTN PIN_BUTTON_A
 const unsigned long DEBOUNCE_MS = 30;
 
 #define SECRET                0xEC
 #define MAX_NEIGHBORS         6
 #define NEIGHBORS_TIMEOUT_MS  (3UL * 2000UL)  // 3 missed pulses = LOST
-#define DEBUG_RAW             1                // 1 = prints raw received bytes
 #define DRIFT_MIN_SPAN_MS     60000UL          // minimum window for calculating drift
 
 // Packet size: 6 bytes for payload + header library overhead
@@ -77,7 +90,9 @@ void updateNeighbor(uint8_t _id, uint32_t _remoteTimestamp, int _rssi, unsigned 
   if(index == -1){
     index = freeSlot();
     if(index == -1){
+#if ENABLE_SERIAL_LOG && LOG_WARNINGS
       Serial.println("WARNING: neighbor table full");
+#endif
       return;
     }
 
@@ -87,8 +102,10 @@ void updateNeighbor(uint8_t _id, uint32_t _remoteTimestamp, int _rssi, unsigned 
     neighbors[index].firstSeenMs = _now;
     neighbors[index].firstRemoteTs = _remoteTimestamp;
 
+#if ENABLE_SERIAL_LOG && LOG_NEIGHBOR_EVENTS
     Serial.print("New neighbor ");
     Serial.println(_id);
+#endif
   }
 
   Neighbor &n = neighbors[index];
@@ -98,6 +115,7 @@ void updateNeighbor(uint8_t _id, uint32_t _remoteTimestamp, int _rssi, unsigned 
     unsigned long interval = _now - n.lastSeenMs;
 
     if(interval > (SEND_INTERVAL_MS * 3) / 2){
+#if ENABLE_SERIAL_LOG && LOG_GAPS
       unsigned long missed = (interval / SEND_INTERVAL_MS) - 1;
       Serial.print("GAP from ");
       Serial.print(n.id);
@@ -106,6 +124,7 @@ void updateNeighbor(uint8_t _id, uint32_t _remoteTimestamp, int _rssi, unsigned 
       Serial.print(" ms (~");
       Serial.print(missed);
       Serial.println( "missed)");
+#endif
     } else {
       n.lastIntervalMs = interval;
       n.avgIntervalMs = (n.avgIntervalMs == 0)
@@ -127,6 +146,7 @@ void updateNeighbor(uint8_t _id, uint32_t _remoteTimestamp, int _rssi, unsigned 
   if (localSpan >= DRIFT_MIN_SPAN_MS) {
     n.driftPpm = ((float)remoteSpan - (float)localSpan) / (float)localSpan * 1e6f;
 
+#if ENABLE_SERIAL_LOG && LOG_WARNINGS
     if (n.driftPpm > 5000.0f || n.driftPpm < -5000.0f) {
       Serial.print("WARNING: drift out of bounds for ");
       Serial.print(n.id);
@@ -134,8 +154,10 @@ void updateNeighbor(uint8_t _id, uint32_t _remoteTimestamp, int _rssi, unsigned 
       Serial.print(n.driftPpm, 1);
       Serial.println(" ppm). Verify timestamp.");
     }
+#endif
   }
 
+#if ENABLE_SERIAL_LOG && LOG_RX
   if(n.pulseCount % LOG_EVERY_N_PULSES == 0){
     Serial.print("RX | id: ");
     Serial.print(n.id);
@@ -146,22 +168,25 @@ void updateNeighbor(uint8_t _id, uint32_t _remoteTimestamp, int _rssi, unsigned 
     Serial.print(" last remote timestamp: ");
     Serial.println(n.lastRemoteTs);
   }
+#endif
 }
 
 void expireNeighbors(unsigned long _now){
   for(int i = 0; i < MAX_NEIGHBORS; i++){
     if(neighbors[i].active && (_now - neighbors[i].lastSeenMs) > NEIGHBORS_TIMEOUT_MS){
+#if ENABLE_SERIAL_LOG && LOG_NEIGHBOR_EVENTS
       Serial.print("Lost neighbor ");
       Serial.print(neighbors[i].id);
       Serial.print(" (idle ");
       Serial.print(_now - neighbors[i].lastSeenMs);
       Serial.println(" ms)");
-
+#endif
       neighbors[i].active = false;
     }
   }
 }
 
+#if ENABLE_SERIAL_LOG && LOG_NEIGHBORS
 void printNeighborTable(unsigned long _now){
   Serial.println("------ neighbors ------");
   int activeCount = 0;
@@ -182,6 +207,7 @@ void printNeighborTable(unsigned long _now){
   Serial.print(activeCount);
   Serial.println(" ------");
 }
+#endif
 
 // ------ Radio ------
 void sendPulse() {
@@ -202,17 +228,19 @@ void sendPulse() {
   MicrobitRadio.send(myDataSent);
   delete myDataSent;
 
+#if ENABLE_SERIAL_LOG && LOG_TX
   Serial.print("TX: pulse sent by: ");
   Serial.print(MY_ID);
   Serial.print("  at t = ");
   Serial.println(timeStamp);
+#endif
 }
 
 void handleReceive(unsigned long _now) {
   FrameBuffer* myDataReceived = MicrobitRadio.recv();
   if (myDataReceived == NULL) return;
 
-#if DEBUG_RAW
+#if ENABLE_SERIAL_LOG && DEBUG_RAW
   Serial.print("RAW len=");
   Serial.print(myDataReceived->length);
   for (int i = 0; i < PAYLOAD_LEN; i++) {
@@ -256,9 +284,12 @@ void setup() {
   
   for(int i = 0; i < MAX_NEIGHBORS; i++) neighbors[i].active = false;
 
+
+#if ENABLE_SERIAL_LOG && LOG_BOOT
   Serial.println("Radio ready");
   Serial.println(MY_ID);
   Serial.println("Ready. Waiting for packets...");
+#endif
 }
 
 void loop() {
