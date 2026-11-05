@@ -8,7 +8,7 @@
 //  1 = enabled, 0 = disabled
 // ==================================================
 #define ENABLE_SERIAL_LOG     1   // master switch: 0 disables all serial logging
-#define LOG_BOOT              0   // boot messages
+#define LOG_BOOT              1   // boot messages
 #define LOG_TX                1   // “TX: pulse sent...”
 #define LOG_RX                1   // periodic RX line (every LOG_EVERY_N_PULSES)
 #define LOG_NEIGHBORS         1   // neighbours table (periodic report)
@@ -23,11 +23,11 @@ const unsigned long DEBOUNCE_MS = 30;
 #define SECRET                0xEC
 #define MAX_NEIGHBORS         6
 #define NEIGHBORS_TIMEOUT_MS  (3UL * 2000UL)  // 3 missed pulses = LOST
-#define DRIFT_MIN_SPAN_MS     60000UL          // minimum window for calculating drift
+#define DRIFT_MIN_SPAN_MS     60000UL         // minimum window for calculating drift
 
-// Packet size: 6 bytes for payload + header library overhead
-#define PAYLOAD_LEN     6
-#define RADIO_LEN       (PAYLOAD_LEN + MICROBIT_RADIO_HEADER_SIZE - 1) // = 9
+// Packet size: 9 bytes for payload + header library overhead
+#define PAYLOAD_LEN     9                     // 1 SECRET + 4 ID + 4 timestamp
+#define RADIO_LEN       (PAYLOAD_LEN + MICROBIT_RADIO_HEADER_SIZE - 1) // = 12
 
 NRF52_Radio MicrobitRadio = NRF52_Radio();
 Adafruit_Microbit_Matrix matrix;
@@ -37,10 +37,10 @@ const int GROUP = 42;     // 0 - 255
 const int BAND = 50;      // 0 - 100
 const int POWER = 7;      // 0 - 7
 
-const uint8_t MY_ID = 1;  // Must be diffent for each board
+uint32_t MY_ID;  // Must be diffent for each board
 
 struct Neighbor{
-  uint8_t         id;
+  uint32_t        id;
   bool            active;
   unsigned long   firstSeenMs;
   unsigned long   lastSeenMs;
@@ -97,9 +97,9 @@ const unsigned long FRAME_INTERVAL_MS = 80; // Frame duration
 // -------------- Function declaration --------------
 // ==================================================
 // Table management
-int findNeighbor(uint8_t _id);
+int findNeighbor(uint32_t _id);
 int freeSlot();
-void updateNeighbor(uint8_t _id, uint32_t _remoteTimestamp, int _rssi, unsigned long _now);
+void updateNeighbor(uint32_t _id, uint32_t _remoteTimestamp, int _rssi, unsigned long _now);
 void expireNeighbors(unsigned long _now);
 void printNeighborTable(unsigned long _now);
 // Radio
@@ -111,7 +111,7 @@ void updateAnimation();
 
 // ------ Table management ------
 
-int findNeighbor(uint8_t _id){
+int findNeighbor(uint32_t _id){
   for(int i = 0; i < MAX_NEIGHBORS; i++){
     if(neighbors[i].active && neighbors[i].id == _id){
       return i;
@@ -129,7 +129,7 @@ int freeSlot(){
   return -1;
 }
 
-void updateNeighbor(uint8_t _id, uint32_t _remoteTimestamp, int _rssi, unsigned long _now){
+void updateNeighbor(uint32_t _id, uint32_t _remoteTimestamp, int _rssi, unsigned long _now){
   int index = findNeighbor(_id);
   if(index == -1){
     index = freeSlot();
@@ -262,11 +262,14 @@ void sendPulse() {
 
   //  Byte-by-byte encoded timestamp (little-endian)
   myDataSent->payload[0] = SECRET;
-  myDataSent->payload[1] = MY_ID;
-  myDataSent->payload[2] = (timeStamp      ) & 0xFF;
-  myDataSent->payload[3] = (timeStamp >>  8) & 0xFF;
-  myDataSent->payload[4] = (timeStamp >> 16) & 0xFF;
-  myDataSent->payload[5] = (timeStamp >> 24) & 0xFF;
+  myDataSent->payload[1] = (MY_ID      ) & 0xFF;
+  myDataSent->payload[2] = (MY_ID >>  8) & 0xFF;
+  myDataSent->payload[3] = (MY_ID >> 16) & 0xFF;
+  myDataSent->payload[4] = (MY_ID >> 24) & 0xFF;
+  myDataSent->payload[5] = (timeStamp      ) & 0xFF;
+  myDataSent->payload[6] = (timeStamp >>  8) & 0xFF;
+  myDataSent->payload[7] = (timeStamp >> 16) & 0xFF;
+  myDataSent->payload[8] = (timeStamp >> 24) & 0xFF;
 
   myDataSent->length = RADIO_LEN;
 
@@ -297,17 +300,21 @@ void handleReceive(unsigned long _now) {
 #endif
 
   if (myDataReceived->length >= RADIO_LEN && myDataReceived->payload[0] == SECRET) {
-    uint8_t  id = myDataReceived->payload[1];
     uint8_t *p  = myDataReceived->payload;
 
-    uint32_t remoteTs = (uint32_t)p[2]
-                      | ((uint32_t)p[3] << 8)
-                      | ((uint32_t)p[4] << 16)
-                      | ((uint32_t)p[5] << 24);
+    uint32_t  id = ((uint32_t)p[1])
+                 | ((uint32_t)p[2] << 8)
+                 | ((uint32_t)p[3] << 16)
+                 | ((uint32_t)p[4] << 24);
+  
+    uint32_t remoteTs = (uint32_t)p[5]
+                      | ((uint32_t)p[6] << 8)
+                      | ((uint32_t)p[7] << 16)
+                      | ((uint32_t)p[8] << 24);
 
     if (id != MY_ID) {
       updateNeighbor(id, remoteTs, myDataReceived->rssi, _now);
-        startAnimation(ANIM_RX);
+      startAnimation(ANIM_RX);
     }
   }
 
@@ -344,6 +351,17 @@ void updateAnimation(){
 void setup() {
   Serial.begin(115200);
   delay(1000);
+
+  // Automatic ID signing
+  uint32_t deviceId = NRF_FICR->DEVICEID[1];
+  MY_ID = (uint8_t)(deviceId & 0xFF);
+
+#if ENABLE_SERIAL_LOG && LOG_BOOT
+  Serial.print("Device ID (32-bit): 0x");
+  Serial.println(deviceId, HEX);
+  Serial.print("MY_ID (8-bit): ");
+  Serial.println(MY_ID);
+#endif
 
   pinMode(PIN_BTN, INPUT_PULLUP);
   lastReading = stableState = digitalRead(PIN_BTN);
