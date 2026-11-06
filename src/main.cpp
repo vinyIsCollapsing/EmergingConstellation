@@ -1,4 +1,6 @@
 #include <Arduino.h>
+#include <math.h>
+#include <string.h>
 #include "MicrobitV2-HHS.h"
 #include "NRF52_Radio_library.h"
 #include "Adafruit_Microbit.h"
@@ -9,26 +11,46 @@
 // ==================================================
 #define ENABLE_SERIAL_LOG     1   // master switch: 0 disables all serial logging
 #define LOG_BOOT              1   // boot messages
-#define LOG_TX                1   // “TX: pulse sent...”
+#define LOG_TX                1   // TX: pulse sent and FIRE line
 #define LOG_RX                1   // periodic RX line (every LOG_EVERY_N_PULSES)
 #define LOG_NEIGHBORS         1   // neighbours table (periodic report)
 #define LOG_NEIGHBOR_EVENTS   0   // “New neighbour” and “Lost neighbour”
 #define LOG_GAPS              0   // “GAP from ...” (lost packets)
 #define LOG_WARNINGS          1   // warnings (table full, drift out of range)
 #define DEBUG_RAW             0   // raw bytes received (verbose)
-#define LOG_PHASE             1   // log phase-difference metric per RX
+#define LOG_PHASE             1   // KICK and PHASE lines per received pulse
+#define LOG_WAVE              1   // SYNC and WAVE lines
 
 #define PIN_BTN PIN_BUTTON_A
 const unsigned long DEBOUNCE_MS = 30;
 
-#define SECRET                0xEC
+// ==================================================
+//  PACKET TYPES AND LAYOUT
+//  All packets use the same length (RADIO_LEN).
+//  Pulse: [0]=SECRET_PULSE [1..4]=sender id [5..8]=timestamp
+//  Wave : [0]=SECRET_WAVE  [1..4]=sender id [5..8]=target id
+//         [9]=hop [10]=wave id [11..14]=origin id
+// ==================================================
+#define SECRET_PULSE          0xEC
+#define SECRET_WAVE           0xED
+
+// ==================================================
+//  SYNCHRONIZATION AND WAVE CONFIG
+// ==================================================
+#define SYNC_PULSES           5                // consecutive pulses within tolerance
+const float SYNC_TOL = 0.05f;                  // |diff| tolerance, in periods
+
+#define WAVE_FRAME_MS        120               // duration of each column
+#define WAVE_ARM_MIN_MS      100               // random delay before starting a wave
+#define WAVE_ARM_MAX_MS      400
+#define MAX_WAVE_HOPS        12                // safety bound on the chain length
+
 #define MAX_NEIGHBORS         6
 #define NEIGHBORS_TIMEOUT_MS  (3UL * 2000UL)  // 3 missed pulses = LOST
 #define DRIFT_MIN_SPAN_MS     60000UL         // minimum window for calculating drift
 
-// Packet size: 9 bytes for payload + header library overhead
-#define PAYLOAD_LEN     9                     // 1 SECRET + 4 ID + 4 timestamp
-#define RADIO_LEN       (PAYLOAD_LEN + MICROBIT_RADIO_HEADER_SIZE - 1) // = 12
+#define PAYLOAD_LEN     15                     // 1 SECRET + 4 sender + 4 target/ts + 2 hop/id + 4 origin
+#define RADIO_LEN       (PAYLOAD_LEN + MICROBIT_RADIO_HEADER_SIZE - 1) // = 18
 
 NRF52_Radio MicrobitRadio = NRF52_Radio();
 Adafruit_Microbit_Matrix matrix;
@@ -51,7 +73,8 @@ struct Neighbor{
   unsigned long   pulseCount;
   unsigned long   lastIntervalMs;
   float           avgIntervalMs;
-  float           driftPpm; 
+  float           driftPpm;
+  uint8_t         syncCount;
 };
 
 Neighbor neighbors[MAX_NEIGHBORS];
@@ -71,7 +94,7 @@ unsigned long lastChangeMs = 0;
 // --- Animation state ---
 enum AnimationType {ANIM_NONE, ANIM_TX, ANIM_RX};
 
-AnimationType currenteAnimation = ANIM_NONE;
+AnimationType currentAnimation = ANIM_NONE;
 uint8_t animationFrame = 0;
 unsigned long lastFrameMs = 0;
 
@@ -93,6 +116,36 @@ const uint8_t RX_FRAMES[][5] = {
 
 const uint8_t NUM_FRAMES = 4;
 const unsigned long FRAME_INTERVAL_MS = 80; // Frame duration
+
+// --- Wave animation state ---
+// Column sweep from left (column 0) to right (column 4).
+// Bit 4 is the leftmost pixel of each row. If the sweep looks mirrored
+// on your board, change bit 4 to bit 0 in each row.
+const uint8_t WAVE_FRAMES[5][5] = {
+  {0b10000, 0b10000, 0b10000, 0b10000, 0b10000},
+  {0b01000, 0b01000, 0b01000, 0b01000, 0b01000},
+  {0b00100, 0b00100, 0b00100, 0b00100, 0b00100},
+  {0b00010, 0b00010, 0b00010, 0b00010, 0b00010},
+  {0b00001, 0b00001, 0b00001, 0b00001, 0b00001}
+};
+
+bool          waveActive       = false;
+uint8_t       waveFrame        = 0;
+unsigned long lastWaveFrameMs  = 0;
+uint8_t       waveHop          = 0;     // position of this board in the chain
+uint8_t       waveId           = 0;     // id of the wave currently playing
+uint32_t      waveOrigin       = 0;     // board that started the wave
+uint8_t       waveCounter      = 0;     // waves started by this board
+
+// Dedupe: a board plays a given (origin, id) wave only once
+uint32_t lastWaveOrigin = 0;
+uint8_t  lastWaveSeen   = 0;
+bool     hasLastWave    = false;
+
+// --- Synchronization detection ---
+bool          syncArmed   = true;    // ready to trigger on the next sync episode
+bool          waveArmed   = false;   // a wave start is scheduled
+unsigned long waveArmAtMs = 0;
 
 // Coupled oscillator (Mirollo-Strogatz)
 const float   PERIOD_MS     = 2000.0f;  // Natural period (ms)
@@ -119,18 +172,48 @@ bool          everFired            = false;
 // ==================================================
 // -------------- Function declaration --------------
 // ==================================================
+// Byte helpers
+uint32_t readU32(const uint8_t *p);
+void     writeU32(uint8_t *p, uint32_t v);
 // Table management
 int findNeighbor(uint32_t _id);
 int freeSlot();
+int  pickNextNeighbor();
+bool isSynced();
 void updateNeighbor(uint32_t _id, uint32_t _remoteTimestamp, int _rssi, unsigned long _now);
 void expireNeighbors(unsigned long _now);
 void printNeighborTable(unsigned long _now);
 // Radio
 void sendPulse();
+void sendWave(uint32_t target, uint8_t hop, uint8_t id, uint32_t origin);
+void handlePulse(uint32_t id, uint32_t remoteTs, int rssi, unsigned long now);
+void handleWave(uint32_t target, uint8_t hop, uint8_t id, uint32_t origin);
 void handleReceive(unsigned long _now);
 // Animation
 void startAnimation(AnimationType _type);
 void updateAnimation();
+void startWave(uint8_t hop, uint8_t id, uint32_t origin);
+void updateWave(unsigned long now);
+void forwardWave();
+void startWaveLocal();
+void updateSyncWave(unsigned long now);
+
+// ==================================================
+// ------------- Byte helpers -------------
+// ==================================================
+uint32_t readU32(const uint8_t *p) {
+  return (uint32_t)p[0]
+       | ((uint32_t)p[1] << 8)
+       | ((uint32_t)p[2] << 16)
+       | ((uint32_t)p[3] << 24);
+}
+
+void writeU32(uint8_t *p, uint32_t v) {
+  p[0] = (v      ) & 0xFF;
+  p[1] = (v >>  8) & 0xFF;
+  p[2] = (v >> 16) & 0xFF;
+  p[3] = (v >> 24) & 0xFF;
+}
 
 // ------ Table management ------
 
@@ -150,6 +233,34 @@ int freeSlot(){
     }
   }
   return -1;
+}
+
+// Next board in the ring: smallest active id greater than ours,
+// or the smallest active id if we are the highest.
+int pickNextNeighbor() {
+  int best = -1;
+  int smallest = -1;
+  for (int i = 0; i < MAX_NEIGHBORS; i++) {
+    if (!neighbors[i].active) continue;
+    if (smallest < 0 || neighbors[i].id < neighbors[smallest].id) smallest = i;
+    if (neighbors[i].id > MY_ID &&
+        (best < 0 || neighbors[i].id < neighbors[best].id)) {
+      best = i;
+    }
+  }
+  return (best >= 0) ? best : smallest;
+}
+
+// Synchronized: at least one neighbor, and every active neighbor
+// has been within tolerance for SYNC_PULSES consecutive pulses.
+bool isSynced() {
+  int active = 0;
+  for (int i = 0; i < MAX_NEIGHBORS; i++) {
+    if (!neighbors[i].active) continue;
+    active++;
+    if (neighbors[i].syncCount < SYNC_PULSES) return false;
+  }
+  return active > 0;
 }
 
 void updateNeighbor(uint32_t _id, uint32_t _remoteTimestamp, int _rssi, unsigned long _now){
@@ -280,19 +391,13 @@ void printNeighborTable(unsigned long _now){
 void sendPulse() {
   startAnimation(ANIM_TX);
   FrameBuffer* myDataSent = new FrameBuffer();
-  
+
   uint32_t timeStamp = millis();
 
-  //  Byte-by-byte encoded timestamp (little-endian)
-  myDataSent->payload[0] = SECRET;
-  myDataSent->payload[1] = (MY_ID      ) & 0xFF;
-  myDataSent->payload[2] = (MY_ID >>  8) & 0xFF;
-  myDataSent->payload[3] = (MY_ID >> 16) & 0xFF;
-  myDataSent->payload[4] = (MY_ID >> 24) & 0xFF;
-  myDataSent->payload[5] = (timeStamp      ) & 0xFF;
-  myDataSent->payload[6] = (timeStamp >>  8) & 0xFF;
-  myDataSent->payload[7] = (timeStamp >> 16) & 0xFF;
-  myDataSent->payload[8] = (timeStamp >> 24) & 0xFF;
+  memset(myDataSent->payload, 0, PAYLOAD_LEN);
+  myDataSent->payload[0] = SECRET_PULSE;
+  writeU32(&myDataSent->payload[1], MY_ID);
+  writeU32(&myDataSent->payload[5], timeStamp);
 
   myDataSent->length = RADIO_LEN;
 
@@ -304,14 +409,116 @@ void sendPulse() {
   Serial.print(MY_ID);
   Serial.print("  at t = ");
   Serial.println(timeStamp);
-#endif
 
-#if ENABLE_SERIAL_LOG && LOG_TX
   Serial.print("FIRE | t=");
   Serial.print(timeStamp);
   Serial.print(" phase_after=");
   Serial.println(phase, 3);
 #endif
+}
+
+void sendWave(uint32_t target, uint8_t hop, uint8_t id, uint32_t origin) {
+  FrameBuffer* myDataSent = new FrameBuffer();
+
+  memset(myDataSent->payload, 0, PAYLOAD_LEN);
+  myDataSent->payload[0] = SECRET_WAVE;
+  writeU32(&myDataSent->payload[1],  MY_ID);
+  writeU32(&myDataSent->payload[5],  target);
+  myDataSent->payload[9]  = hop;
+  myDataSent->payload[10] = id;
+  writeU32(&myDataSent->payload[11], origin);
+
+  myDataSent->length = RADIO_LEN;
+
+  MicrobitRadio.send(myDataSent);
+  delete myDataSent;
+
+#if ENABLE_SERIAL_LOG && LOG_WAVE
+  Serial.print("WAVE | send to=");
+  Serial.print(target);
+  Serial.print(" hop=");
+  Serial.print(hop);
+  Serial.print(" id=");
+  Serial.print(id);
+  Serial.print(" origin=");
+  Serial.println(origin);
+#endif
+}
+
+void handlePulse(uint32_t id, uint32_t remoteTs, int rssi, unsigned long now) {
+  updateNeighbor(id, remoteTs, rssi, now);
+  startAnimation(ANIM_RX);
+
+  // Phase difference relative to our last fire, in [-0.5, +0.5]
+  float phaseDiff = 0.0f;
+  if (everFired) {
+    unsigned long sinceFire = (now - lastFireMs) % (unsigned long)PERIOD_MS;
+    phaseDiff = (float)sinceFire / PERIOD_MS;
+    if (phaseDiff > 0.5f) phaseDiff -= 1.0f;
+  }
+
+  // Sync counter per neighbor
+  int idx = findNeighbor(id);
+  if (idx >= 0 && everFired) {
+    if (fabsf(phaseDiff) < SYNC_TOL) {
+      if (neighbors[idx].syncCount < 255) neighbors[idx].syncCount++;
+    } else {
+      neighbors[idx].syncCount = 0;
+    }
+  }
+
+  // Mirollo-Strogatz coupling with concave response and absorption
+  float phaseBefore = phase;
+  float s = phaseToState(phase) + EPSILON;
+  if (s >= 1.0f) {
+    phase = 1.0f;                  // absorption: fires on the next loop()
+  } else {
+    phase = stateToPhase(s);
+  }
+
+#if ENABLE_SERIAL_LOG && LOG_PHASE
+  Serial.print("KICK | id=");
+  Serial.print((unsigned long)id);
+  Serial.print(" before=");
+  Serial.print(phaseBefore, 3);
+  Serial.print(" after=");
+  Serial.println(phase, 3);
+
+  if (everFired) {
+    Serial.print("PHASE | id=");
+    Serial.print((unsigned long)id);
+    Serial.print(" diff=");
+    Serial.print(phaseDiff, 3);
+    Serial.print(" phase=");
+    Serial.println(phase, 3);
+  }
+#endif
+}
+
+void handleWave(uint32_t target, uint8_t hop, uint8_t id, uint32_t origin) {
+  // A wave is already travelling: do not start a competing one
+  waveArmed = false;
+
+  if (waveActive) return;
+  if (target != MY_ID) return;
+
+  // Ignore duplicates of a wave already played
+  if (hasLastWave && origin == lastWaveOrigin && id == lastWaveSeen) return;
+
+  lastWaveOrigin = origin;
+  lastWaveSeen   = id;
+  hasLastWave    = true;
+
+#if ENABLE_SERIAL_LOG && LOG_WAVE
+  Serial.print("WAVE | recv hop=");
+  Serial.print(hop);
+  Serial.print(" id=");
+  Serial.print(id);
+  Serial.print(" origin=");
+  Serial.println(origin);
+#endif
+
+  startWave(hop, id, origin);
 }
 
 void handleReceive(unsigned long _now) {
@@ -321,7 +528,7 @@ void handleReceive(unsigned long _now) {
 #if ENABLE_SERIAL_LOG && DEBUG_RAW
   Serial.print("RAW len=");
   Serial.print(myDataReceived->length);
-  for (int i = 0; i < PAYLOAD_LEN; i++) {
+  for (int i = 0; i < 9; i++) {
     Serial.print(" ");
     if (myDataReceived->payload[i] < 0x10) Serial.print("0");
     Serial.print(myDataReceived->payload[i], HEX);
@@ -329,55 +536,16 @@ void handleReceive(unsigned long _now) {
   Serial.println();
 #endif
 
-  if (myDataReceived->length >= RADIO_LEN && myDataReceived->payload[0] == SECRET) {
-    uint8_t *p  = myDataReceived->payload;
+  if (myDataReceived->length >= RADIO_LEN) {
+    uint8_t *p = myDataReceived->payload;
+    uint32_t senderId = readU32(&p[1]);
 
-    uint32_t  id = ((uint32_t)p[1])
-                 | ((uint32_t)p[2] << 8)
-                 | ((uint32_t)p[3] << 16)
-                 | ((uint32_t)p[4] << 24);
-  
-    uint32_t remoteTs = (uint32_t)p[5]
-                      | ((uint32_t)p[6] << 8)
-                      | ((uint32_t)p[7] << 16)
-                      | ((uint32_t)p[8] << 24);
-
-    if (id != MY_ID) {
-      updateNeighbor(id, remoteTs, myDataReceived->rssi, _now);
-      startAnimation(ANIM_RX);
-
-      // Mirollo-Strogatz coupling
-      float phaseBefore = phase;
-      float s = phaseToState(phase) + EPSILON;
-      if(s >= 1.0f){
-        phase = 1.0f;
-      } else {
-        phase = stateToPhase(s);
+    if (senderId != MY_ID) {
+      if (p[0] == SECRET_PULSE) {
+        handlePulse(senderId, readU32(&p[5]), myDataReceived->rssi, _now);
+      } else if (p[0] == SECRET_WAVE) {
+        handleWave(readU32(&p[5]), p[9], p[10], readU32(&p[11]));
       }
-#if ENABLE_SERIAL_LOG && LOG_PHASE
-      // KICK: fase antes e depois do ajuste
-      Serial.print("KICK | id=");
-      Serial.print((unsigned long)id);
-      Serial.print(" before=");
-      Serial.print(phaseBefore, 3);
-      Serial.print(" after=");
-      Serial.println(phase, 3);
-
-      // Sync metric: how long after our last fire did this pulse arrive?
-      // phaseDiff in [-0.5, +0.5]: 0 = in phase, ±0.5 = anti-phase.
-      // PHASE: phase difference relative to our last shot
-      if (everFired) {
-        unsigned long sinceFire = (_now - lastFireMs) % (unsigned long)PERIOD_MS;
-        float phaseDiff = (float)sinceFire / PERIOD_MS;
-        if (phaseDiff > 0.5f) phaseDiff -= 1.0f;
-        Serial.print("PHASE | id=");
-        Serial.print((unsigned long)id);
-        Serial.print(" diff=");
-        Serial.print(phaseDiff, 3);
-        Serial.print(" phase=");
-        Serial.println(phase, 3);
-      }
-#endif
     }
   }
 
@@ -385,28 +553,129 @@ void handleReceive(unsigned long _now) {
 }
 
 // ---------- Animation ----------
-void startAnimation(AnimationType _type){
-  currenteAnimation = _type;
+void startAnimation(AnimationType _type) {
+  if (waveActive) return;          // the wave has priority on the matrix
+  currentAnimation = _type;
   animationFrame = 0;
   lastFrameMs = millis();
 }
 
-void updateAnimation(){
-  if(currenteAnimation == ANIM_NONE) return;
+void updateAnimation() {
+  if (currentAnimation == ANIM_NONE) return;
 
   unsigned long now = millis();
-  if(now - lastFrameMs >= FRAME_INTERVAL_MS){
+  if (now - lastFrameMs >= FRAME_INTERVAL_MS) {
     lastFrameMs = now;
     animationFrame++;
 
-    if(animationFrame >= NUM_FRAMES){
+    if (animationFrame >= NUM_FRAMES) {
       matrix.clear();
-      currenteAnimation = ANIM_NONE;
+      currentAnimation = ANIM_NONE;
       return;
     }
 
-    const uint8_t (*frames)[5] = (currenteAnimation == ANIM_TX) ? TX_FRAMES : RX_FRAMES;
+    const uint8_t (*frames)[5] = (currentAnimation == ANIM_TX) ? TX_FRAMES : RX_FRAMES;
     matrix.show(frames[animationFrame]);
+  }
+}
+
+// ==================================================
+// ------------- Wave animation -------------
+// ==================================================
+
+void startWave(uint8_t hop, uint8_t id, uint32_t origin) {
+  waveActive      = true;
+  waveFrame       = 0;
+  waveHop         = hop;
+  waveId          = id;
+  waveOrigin      = origin;
+  lastWaveFrameMs = millis();
+  currentAnimation = ANIM_NONE;    // stop any TX/RX animation in progress
+  matrix.show(WAVE_FRAMES[0]);
+}
+
+void updateWave(unsigned long now) {
+  if (!waveActive) return;
+  if (now - lastWaveFrameMs < WAVE_FRAME_MS) return;
+
+  lastWaveFrameMs = now;
+  waveFrame++;
+
+  if (waveFrame >= 5) {
+    matrix.clear();
+    waveActive = false;
+    forwardWave();                 // this board's part is done: pass the wave on
+    return;
+  }
+
+  matrix.show(WAVE_FRAMES[waveFrame]);
+}
+
+// Passes the wave to the next board, unless the lap is complete
+void forwardWave() {
+  uint8_t nextHop = waveHop + 1;
+  if (nextHop > MAX_WAVE_HOPS) {
+#if ENABLE_SERIAL_LOG && LOG_WAVE
+    Serial.println("WAVE | hop limit reached, stopping");
+#endif
+    return;
+  }
+
+  int idx = pickNextNeighbor();
+  if (idx < 0) {
+#if ENABLE_SERIAL_LOG && LOG_WAVE
+    Serial.println("WAVE | no neighbor to forward to");
+#endif
+    return;
+  }
+
+  uint32_t target = neighbors[idx].id;
+  if (target == waveOrigin) {
+#if ENABLE_SERIAL_LOG && LOG_WAVE
+    Serial.println("WAVE | lap complete");
+#endif
+    return;
+  }
+
+  sendWave(target, nextHop, waveId, waveOrigin);
+}
+
+// This board starts a wave (hop 0). Called when the sync arming expires.
+void startWaveLocal() {
+  waveCounter++;
+  lastWaveOrigin = MY_ID;
+  lastWaveSeen   = waveCounter;
+  hasLastWave    = true;
+
+#if ENABLE_SERIAL_LOG && LOG_WAVE
+  Serial.print("WAVE | start local, id=");
+  Serial.println(waveCounter);
+#endif
+
+  startWave(0, waveCounter, MY_ID);
+}
+
+// Arms a wave start once per sync episode, with a random delay.
+// If a wave from another board arrives first, handleWave() cancels it.
+void updateSyncWave(unsigned long now) {
+  if (!isSynced()) {
+    syncArmed = true;              // re-arm for the next sync episode
+    waveArmed = false;             // cancel any pending start
+    return;
+  }
+
+  if (syncArmed && !waveActive && !waveArmed) {
+    syncArmed = false;
+    waveArmed = true;
+    waveArmAtMs = now + (unsigned long)random(WAVE_ARM_MIN_MS, WAVE_ARM_MAX_MS + 1);
+#if ENABLE_SERIAL_LOG && LOG_WAVE
+    Serial.println("SYNC | synchronized, arming wave");
+#endif
+  }
+
+  if (waveArmed && now >= waveArmAtMs) {
+    waveArmed = false;
+    if (!waveActive) startWaveLocal();
   }
 }
 
@@ -500,10 +769,16 @@ void loop() {
   handleReceive(now);
   expireNeighbors(now);
 
+  // Synchronization and wave
+  updateSyncWave(now);
+  updateWave(now);
+
   updateAnimation();
 
+#if ENABLE_SERIAL_LOG && LOG_NEIGHBORS
   if(now - lastReportMs >= REPORT_INTERVAL_MS){
     lastReportMs = now;
     printNeighborTable(now);
   }
+#endif
 }

@@ -83,36 +83,3 @@ EmergingConstellation/
 
 To be defined.
 
-
-TX: pulse sDevice ID (32-bit): 0xB3702CCF
-MY_ID (8-bit): 207
-State: 3. State 3 = RX (Reception started, register monitored.
-Radio ready
-207
-Ready. Waiting for packets...
-TX: pulse sent by: 207  at t = 2000
-
-Device ID (32-bit): 0xC761C2F9
-MY_ID (8-bit): 249
-State: 3. State 3 = RX (Reception started, register monitored.
-Radio ready
-249
-Ready. Waiting for packets...
-TX: pulse sent by: 249  at t = 2000
-
---- Quit: Ctrl+C | Menu: Ctrl+T | Help: Ctrl+T followed by Ctrl+H
-Device ID (32-bit): 0x4BA4105A
-MY_ID (8-bit): 90
-State: 3. State 3 = RX (Reception started, register monitored.
-Radio ready
-90
-Ready. Waiting for packets...
-TX: pulse sent by: 90  at t = 2000
-
-Device ID (32-bit): 0x94E44C54
-MY_ID (8-bit): 84
-State: 3. State 3 = RX (Reception started, register monitored.
-Radio ready
-84
-Ready. Waiting for packets...
-TX: pulse sent by: 84  at t = 2000
