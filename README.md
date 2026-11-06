@@ -108,3 +108,11 @@ Radio ready
 90
 Ready. Waiting for packets...
 TX: pulse sent by: 90  at t = 2000
+
+Device ID (32-bit): 0x94E44C54
+MY_ID (8-bit): 84
+State: 3. State 3 = RX (Reception started, register monitored.
+Radio ready
+84
+Ready. Waiting for packets...
+TX: pulse sent by: 84  at t = 2000

@@ -16,6 +16,7 @@
 #define LOG_GAPS              0   // “GAP from ...” (lost packets)
 #define LOG_WARNINGS          1   // warnings (table full, drift out of range)
 #define DEBUG_RAW             0   // raw bytes received (verbose)
+#define LOG_PHASE             1   // log phase-difference metric per RX
 
 #define PIN_BTN PIN_BUTTON_A
 const unsigned long DEBOUNCE_MS = 30;
@@ -92,6 +93,28 @@ const uint8_t RX_FRAMES[][5] = {
 
 const uint8_t NUM_FRAMES = 4;
 const unsigned long FRAME_INTERVAL_MS = 80; // Frame duration
+
+// Coupled oscillator (Mirollo-Strogatz)
+const float   PERIOD_MS     = 2000.0f;  // Natural period (ms)
+const float   EPSILON       = 0.02f;    // phase advance per received pulse
+const float   RESP_B        = 3.0f;     // curvature of the concave response (b > 0)
+
+// Concave response function: maps phase in [0,1] to state in [0,1]
+// and back. The pulse adds EPSILON to the state, which is what makes
+// the coupling absorbing and drives the system toward synchrony.
+float phaseToState(float x) {
+  return logf(1.0f + (expf(RESP_B) - 1.0f) * x) / RESP_B;
+}
+
+float stateToPhase(float s) {
+  return (expf(RESP_B * s) - 1.0f) / (expf(RESP_B) - 1.0f);
+}
+
+// Oscillator state
+float         phase                = 0.0f;
+unsigned long lastPhaseUpdateMs    = 0;
+unsigned long lastFireMs           = 0;
+bool          everFired            = false;
 
 // ==================================================
 // -------------- Function declaration --------------
@@ -282,6 +305,13 @@ void sendPulse() {
   Serial.print("  at t = ");
   Serial.println(timeStamp);
 #endif
+
+#if ENABLE_SERIAL_LOG && LOG_TX
+  Serial.print("FIRE | t=");
+  Serial.print(timeStamp);
+  Serial.print(" phase_after=");
+  Serial.println(phase, 3);
+#endif
 }
 
 void handleReceive(unsigned long _now) {
@@ -315,6 +345,39 @@ void handleReceive(unsigned long _now) {
     if (id != MY_ID) {
       updateNeighbor(id, remoteTs, myDataReceived->rssi, _now);
       startAnimation(ANIM_RX);
+
+      // Mirollo-Strogatz coupling
+      float phaseBefore = phase;
+      float s = phaseToState(phase) + EPSILON;
+      if(s >= 1.0f){
+        phase = 1.0f;
+      } else {
+        phase = stateToPhase(s);
+      }
+#if ENABLE_SERIAL_LOG && LOG_PHASE
+      // KICK: fase antes e depois do ajuste
+      Serial.print("KICK | id=");
+      Serial.print((unsigned long)id);
+      Serial.print(" before=");
+      Serial.print(phaseBefore, 3);
+      Serial.print(" after=");
+      Serial.println(phase, 3);
+
+      // Sync metric: how long after our last fire did this pulse arrive?
+      // phaseDiff in [-0.5, +0.5]: 0 = in phase, ±0.5 = anti-phase.
+      // PHASE: phase difference relative to our last shot
+      if (everFired) {
+        unsigned long sinceFire = (_now - lastFireMs) % (unsigned long)PERIOD_MS;
+        float phaseDiff = (float)sinceFire / PERIOD_MS;
+        if (phaseDiff > 0.5f) phaseDiff -= 1.0f;
+        Serial.print("PHASE | id=");
+        Serial.print((unsigned long)id);
+        Serial.print(" diff=");
+        Serial.print(phaseDiff, 3);
+        Serial.print(" phase=");
+        Serial.println(phase, 3);
+      }
+#endif
     }
   }
 
@@ -378,20 +441,40 @@ void setup() {
   
   for(int i = 0; i < MAX_NEIGHBORS; i++) neighbors[i].active = false;
 
-
 #if ENABLE_SERIAL_LOG && LOG_BOOT
   Serial.println("Radio ready");
   Serial.println(MY_ID);
   Serial.println("Ready. Waiting for packets...");
+#endif
+
+  // Randomize initial phase using the factory ID as seed
+  // (avoids the four boards starting synchronized by accident)
+  randomSeed(NRF_FICR->DEVICEID[0] ^ NRF_FICR->DEVICEID[1]);
+  phase = (float)random(0, 10000) / 10000.0f;
+
+  lastPhaseUpdateMs = millis();
+  lastFireMs        = 0;
+  everFired         = false;
+
+#if ENABLE_SERIAL_LOG && LOG_BOOT
+  Serial.print("Initial phase: ");
+  Serial.println(phase, 3);
 #endif
 }
 
 void loop() {
   unsigned long now = millis();
 
-  // Periodic trigger
-  if(now - lastSend >= SEND_INTERVAL_MS){
-    lastSend = now;
+  // Advance oscillator phase
+  unsigned long dt = now - lastPhaseUpdateMs;
+  lastPhaseUpdateMs = now;
+  phase += (float)dt / PERIOD_MS;
+
+  // Fire when phase reaches 1
+  if(phase >= 1.0f){
+    phase -= 1.0f;      // preserve excess
+    lastFireMs = now;
+    everFired = true;
     sendPulse();
   }
 
@@ -405,6 +488,10 @@ void loop() {
   if (now - lastChangeMs >= DEBOUNCE_MS && reading != stableState) {
     stableState = reading;
     if (stableState == LOW) {
+      // Reset phase and send a pulse
+      phase   = 0.0f;
+      lastFireMs = now;
+      everFired = true;
       sendPulse();
     }
   }
