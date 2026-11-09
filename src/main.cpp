@@ -33,6 +33,7 @@ const unsigned long DEBOUNCE_MS = 30;
 // ==================================================
 #define SECRET_PULSE          0xEC
 #define SECRET_WAVE           0xED
+#define SECRET_WAVE_ACK       0xEE
 
 // ==================================================
 //  SYNCHRONIZATION AND WAVE CONFIG
@@ -40,10 +41,12 @@ const unsigned long DEBOUNCE_MS = 30;
 #define SYNC_PULSES           5                // consecutive pulses within tolerance
 const float SYNC_TOL = 0.05f;                  // |diff| tolerance, in periods
 
-#define WAVE_FRAME_MS        120               // duration of each column
-#define WAVE_ARM_MIN_MS      100               // random delay before starting a wave
-#define WAVE_ARM_MAX_MS      400
-#define MAX_WAVE_HOPS        12                // safety bound on the chain length
+#define WAVE_FRAME_MS         120               // duration of each column
+#define WAVE_ARM_MIN_MS       100               // random delay before starting a wave
+#define WAVE_ARM_MAX_MS       400
+#define MAX_WAVE_HOPS         12                // safety bound on the chain length
+#define WAVE_ACK_TIMEOUT_MS   200
+#define WAVE_MAX_RETRIES      3
 
 #define MAX_NEIGHBORS         6
 #define NEIGHBORS_TIMEOUT_MS  (3UL * 2000UL)  // 3 missed pulses = LOST
@@ -129,13 +132,20 @@ const uint8_t WAVE_FRAMES[5][5] = {
   {0b00001, 0b00001, 0b00001, 0b00001, 0b00001}
 };
 
-bool          waveActive       = false;
-uint8_t       waveFrame        = 0;
-unsigned long lastWaveFrameMs  = 0;
-uint8_t       waveHop          = 0;     // position of this board in the chain
-uint8_t       waveId           = 0;     // id of the wave currently playing
-uint32_t      waveOrigin       = 0;     // board that started the wave
-uint8_t       waveCounter      = 0;     // waves started by this board
+bool          waveActive          = false;
+uint8_t       waveFrame           = 0;
+unsigned long lastWaveFrameMs     = 0;
+uint8_t       waveHop             = 0;     // position of this board in the chain
+uint8_t       waveId              = 0;     // id of the wave currently playing
+uint32_t      waveOrigin          = 0;     // board that started the wave
+uint8_t       waveCounter         = 0;     // waves started by this board
+bool          wavePending         = false;
+uint32_t      wavePendingTarget   = 0;
+uint8_t       wavePendingHop      = 0;
+uint8_t       wavePendingId       = 0;
+uint32_t      wavePendingOrigin   = 0;
+unsigned long wavePendingSentMs   = 0;
+uint8_t       wavePendingTries    = 0;
 
 // Dedupe: a board plays a given (origin, id) wave only once
 uint32_t lastWaveOrigin = 0;
@@ -189,6 +199,8 @@ void sendWave(uint32_t target, uint8_t hop, uint8_t id, uint32_t origin);
 void handlePulse(uint32_t id, uint32_t remoteTs, int rssi, unsigned long now);
 void handleWave(uint32_t target, uint8_t hop, uint8_t id, uint32_t origin);
 void handleReceive(unsigned long _now);
+void sendWaveAck(uint32_t target, uint8_t id, uint32_t origin);
+void handleWaveAck(uint32_t sender, uint32_t target, uint8_t id, uint32_t origin);
 // Animation
 void startAnimation(AnimationType _type);
 void updateAnimation();
@@ -197,6 +209,7 @@ void updateWave(unsigned long now);
 void forwardWave();
 void startWaveLocal();
 void updateSyncWave(unsigned long now);
+void retryPendingWave(unsigned long now);
 
 // ==================================================
 // ------------- Byte helpers -------------
@@ -544,12 +557,53 @@ void handleReceive(unsigned long _now) {
       if (p[0] == SECRET_PULSE) {
         handlePulse(senderId, readU32(&p[5]), myDataReceived->rssi, _now);
       } else if (p[0] == SECRET_WAVE) {
-        handleWave(readU32(&p[5]), p[9], p[10], readU32(&p[11]));
+        uint32_t target = readU32(&p[5]);
+        if (target == MY_ID) {
+          sendWaveAck(senderId, p[10], readU32(&p[11]));
+        }
+        handleWave(target, p[9], p[10], readU32(&p[11]));
+      } else if (p[0] == SECRET_WAVE_ACK) {
+        handleWaveAck(senderId, readU32(&p[5]), p[10], readU32(&p[11]));
       }
     }
   }
 
   delete myDataReceived;
+}
+
+void sendWaveAck(uint32_t target, uint8_t id, uint32_t origin) {
+  FrameBuffer* ack = new FrameBuffer();
+
+  memset(ack->payload, 0, PAYLOAD_LEN);
+  ack->payload[0] = SECRET_WAVE_ACK;
+  writeU32(&ack->payload[1],  MY_ID);
+  writeU32(&ack->payload[5],  target);
+  ack->payload[10] = id;
+  writeU32(&ack->payload[11], origin);
+
+  ack->length = RADIO_LEN;
+
+  MicrobitRadio.send(ack);
+  delete ack;
+
+#if ENABLE_SERIAL_LOG && LOG_WAVE
+  Serial.print("WAVE | ack to=");
+  Serial.println(target);
+#endif
+}
+
+void handleWaveAck(uint32_t sender, uint32_t target, uint8_t id, uint32_t origin) {
+  if (!wavePending) return;
+  if (target != MY_ID) return;
+  if (sender != wavePendingTarget) return;
+  if (id != wavePendingId || origin != wavePendingOrigin) return;
+
+  wavePending = false;
+
+#if ENABLE_SERIAL_LOG && LOG_WAVE
+  Serial.print("WAVE | ack received from ");
+  Serial.println(sender);
+#endif
 }
 
 // ---------- Animation ----------
@@ -584,6 +638,7 @@ void updateAnimation() {
 // ==================================================
 
 void startWave(uint8_t hop, uint8_t id, uint32_t origin) {
+  wavePending     = false;
   waveActive      = true;
   waveFrame       = 0;
   waveHop         = hop;
@@ -638,6 +693,15 @@ void forwardWave() {
   }
 
   sendWave(target, nextHop, waveId, waveOrigin);
+
+  // Keep the packet until the next board confirms it
+  wavePending       = true;
+  wavePendingTarget = target;
+  wavePendingHop    = nextHop;
+  wavePendingId     = waveId;
+  wavePendingOrigin = waveOrigin;
+  wavePendingSentMs = millis();
+  wavePendingTries  = 0;
 }
 
 // This board starts a wave (hop 0). Called when the sync arming expires.
@@ -677,6 +741,33 @@ void updateSyncWave(unsigned long now) {
     waveArmed = false;
     if (!waveActive) startWaveLocal();
   }
+}
+
+void retryPendingWave(unsigned long now) {
+  if (!wavePending) return;
+  if (now - wavePendingSentMs < WAVE_ACK_TIMEOUT_MS) return;
+
+  if (wavePendingTries >= WAVE_MAX_RETRIES) {
+    wavePending = false;
+#if ENABLE_SERIAL_LOG && LOG_WAVE
+    Serial.print("WAVE | no ACK from ");
+    Serial.print(wavePendingTarget);
+    Serial.println(", giving up");
+#endif
+    return;
+  }
+
+  wavePendingTries++;
+  wavePendingSentMs = now;
+
+#if ENABLE_SERIAL_LOG && LOG_WAVE
+  Serial.print("WAVE | retry ");
+  Serial.print(wavePendingTries);
+  Serial.print(" to ");
+  Serial.println(wavePendingTarget);
+#endif
+
+  sendWave(wavePendingTarget, wavePendingHop, wavePendingId, wavePendingOrigin);
 }
 
 // Setup/Loop
@@ -770,6 +861,7 @@ void loop() {
   // Synchronization and wave
   updateSyncWave(now);
   updateWave(now);
+  retryPendingWave(now);
 
   updateAnimation();
 
