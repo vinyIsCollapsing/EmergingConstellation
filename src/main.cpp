@@ -686,12 +686,10 @@ void setup() {
 
   // Automatic ID signing
   uint32_t deviceId = NRF_FICR->DEVICEID[1];
-  MY_ID = (uint8_t)(deviceId & 0xFF);
+  MY_ID = deviceId;
 
 #if ENABLE_SERIAL_LOG && LOG_BOOT
-  Serial.print("Device ID (32-bit): 0x");
-  Serial.println(deviceId, HEX);
-  Serial.print("MY_ID (8-bit): ");
+  Serial.print("MY_ID (32-bit): ");
   Serial.println(MY_ID);
 #endif
 
