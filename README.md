@@ -108,4 +108,6 @@ EmergingConstellation/
 
 ## License
 
-To be defined.
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
+
+It uses [MicrobitV2-HHS](https://github.com/Grrtzm/MicrobitV2-HHS), also MIT-licensed, for the nRF52 radio driver.

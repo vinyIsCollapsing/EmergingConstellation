@@ -52,7 +52,7 @@ const float SYNC_TOL = 0.05f;                  // |diff| tolerance, in periods
 #define WAVE_MAX_RETRIES      3
 
 #define MAX_NEIGHBORS         6
-#define NEIGHBORS_TIMEOUT_MS  (3UL * 2000UL)  // 3 missed pulses = LOST
+#define NEIGHBORS_TIMEOUT_MS  ((unsigned long)(3 * PERIOD_MS))  // 3 missed pulses = LOST
 #define DRIFT_MIN_SPAN_MS     60000UL         // minimum window for calculating drift
 
 #define PAYLOAD_LEN     15                     // 1 SECRET + 4 sender + 4 target/ts + 2 hop/id + 4 origin
@@ -86,11 +86,9 @@ struct Neighbor{
 
 Neighbor neighbors[MAX_NEIGHBORS];
 
-const unsigned long SEND_INTERVAL_MS    = 2000;
 const unsigned long REPORT_INTERVAL_MS  = 5000;
 const unsigned long LOG_EVERY_N_PULSES  = 5;
 
-unsigned long lastSend      = 0;
 unsigned long lastReportMs  = 0;
 
 // Button config
@@ -318,9 +316,9 @@ void updateNeighbor(uint32_t _id, uint32_t _remoteTimestamp, int _rssi, unsigned
   if(n.pulseCount > 0){
     unsigned long interval = _now - n.lastSeenMs;
 
-    if(interval > (SEND_INTERVAL_MS * 3) / 2){
+    if(interval > (unsigned long)(PERIOD_MS * 1.5f)){
 #if ENABLE_SERIAL_LOG && LOG_GAPS
-      unsigned long missed = (interval / SEND_INTERVAL_MS) - 1;
+      unsigned long missed = (interval / (unsigned long)PERIOD_MS) - 1;
       Serial.print("GAP from ");
       Serial.print(n.id);
       Serial.print(": ");
