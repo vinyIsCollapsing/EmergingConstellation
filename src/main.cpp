@@ -9,17 +9,20 @@
 //  LOG / DEBUG CONFIG
 //  1 = enabled, 0 = disabled
 // ==================================================
+#define MEASUREMENT_MODE      0   // 1 = minimal output (only SYNC events and warnings), for timing tests
+
 #define ENABLE_SERIAL_LOG     1   // master switch: 0 disables all serial logging
-#define LOG_BOOT              1   // boot messages
-#define LOG_TX                1   // TX: pulse sent and FIRE line
-#define LOG_RX                1   // periodic RX line (every LOG_EVERY_N_PULSES)
-#define LOG_NEIGHBORS         1   // neighbours table (periodic report)
+#define LOG_BOOT              (!MEASUREMENT_MODE)   // boot messages
+#define LOG_TX                (!MEASUREMENT_MODE)   // TX: pulse sent and FIRE line
+#define LOG_RX                (!MEASUREMENT_MODE)   // periodic RX line (every LOG_EVERY_N_PULSES)
+#define LOG_NEIGHBORS         (!MEASUREMENT_MODE)   // neighbours table (periodic report)
 #define LOG_NEIGHBOR_EVENTS   0   // “New neighbour” and “Lost neighbour”
 #define LOG_GAPS              0   // “GAP from ...” (lost packets)
 #define LOG_WARNINGS          1   // warnings (table full, drift out of range)
 #define DEBUG_RAW             0   // raw bytes received (verbose)
-#define LOG_PHASE             1   // KICK and PHASE lines per received pulse
-#define LOG_WAVE              1   // SYNC and WAVE lines
+#define LOG_PHASE             (!MEASUREMENT_MODE)   // KICK and PHASE lines per received pulse
+#define LOG_WAVE              (!MEASUREMENT_MODE)   // SYNC and WAVE lines
+#define LOG_SYNC_EVENT        1   // one line when the swarm synchronizes: kept in both modes
 
 #define PIN_BTN PIN_BUTTON_A
 const unsigned long DEBOUNCE_MS = 30;
@@ -190,6 +193,7 @@ int findNeighbor(uint32_t _id);
 int freeSlot();
 int  pickNextNeighbor();
 bool isSynced();
+int activeNeighborCount();
 void updateNeighbor(uint32_t _id, uint32_t _remoteTimestamp, int _rssi, unsigned long _now);
 void expireNeighbors(unsigned long _now);
 void printNeighborTable(unsigned long _now);
@@ -274,6 +278,14 @@ bool isSynced() {
     if (neighbors[i].syncCount < SYNC_PULSES) return false;
   }
   return active > 0;
+}
+
+int activeNeighborCount() {
+  int count = 0;
+  for (int i = 0; i < MAX_NEIGHBORS; i++) {
+    if (neighbors[i].active) count++;
+  }
+  return count;
 }
 
 void updateNeighbor(uint32_t _id, uint32_t _remoteTimestamp, int _rssi, unsigned long _now){
@@ -732,8 +744,11 @@ void updateSyncWave(unsigned long now) {
     syncArmed = false;
     waveArmed = true;
     waveArmAtMs = now + (unsigned long)random(WAVE_ARM_MIN_MS, WAVE_ARM_MAX_MS + 1);
-#if ENABLE_SERIAL_LOG && LOG_WAVE
-    Serial.println("SYNC | synchronized, arming wave");
+#if ENABLE_SERIAL_LOG && LOG_SYNC_EVENT
+    Serial.print("SYNC | t=");
+    Serial.print(now);
+    Serial.print(" synchronized, nodes=");
+    Serial.println(activeNeighborCount());
 #endif
   }
 
