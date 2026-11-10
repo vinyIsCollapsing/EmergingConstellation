@@ -59,6 +59,7 @@ const float SYNC_TOL = 0.05f;                  // |diff| tolerance, in periods
 #define RADIO_LEN       (PAYLOAD_LEN + MICROBIT_RADIO_HEADER_SIZE - 1) // = 18
 
 NRF52_Radio MicrobitRadio = NRF52_Radio();
+FrameBuffer txFrame;      // Reusable transmit buffer (avoids heap allocation for every packet)
 Adafruit_Microbit_Matrix matrix;
 
 // Radio config (must be the same in all boards)
@@ -415,19 +416,17 @@ void printNeighborTable(unsigned long _now){
 // ------ Radio ------
 void sendPulse() {
   startAnimation(ANIM_TX);
-  FrameBuffer* myDataSent = new FrameBuffer();
 
   uint32_t timeStamp = millis();
 
-  memset(myDataSent->payload, 0, PAYLOAD_LEN);
-  myDataSent->payload[0] = SECRET_PULSE;
-  writeU32(&myDataSent->payload[1], MY_ID);
-  writeU32(&myDataSent->payload[5], timeStamp);
+  memset(txFrame.payload, 0, PAYLOAD_LEN);
+  txFrame.payload[0] = SECRET_PULSE;
+  writeU32(&txFrame.payload[1], MY_ID);
+  writeU32(&txFrame.payload[5], timeStamp);
 
-  myDataSent->length = RADIO_LEN;
+  txFrame.length = RADIO_LEN;
 
-  MicrobitRadio.send(myDataSent);
-  delete myDataSent;
+  MicrobitRadio.send(&txFrame);
 
 #if ENABLE_SERIAL_LOG && LOG_TX
   Serial.print("TX: pulse sent by: ");
@@ -443,20 +442,18 @@ void sendPulse() {
 }
 
 void sendWave(uint32_t target, uint8_t hop, uint8_t id, uint32_t origin) {
-  FrameBuffer* myDataSent = new FrameBuffer();
 
-  memset(myDataSent->payload, 0, PAYLOAD_LEN);
-  myDataSent->payload[0] = SECRET_WAVE;
-  writeU32(&myDataSent->payload[1],  MY_ID);
-  writeU32(&myDataSent->payload[5],  target);
-  myDataSent->payload[9]  = hop;
-  myDataSent->payload[10] = id;
-  writeU32(&myDataSent->payload[11], origin);
+  memset(txFrame.payload, 0, PAYLOAD_LEN);
+  txFrame.payload[0] = SECRET_WAVE;
+  writeU32(&txFrame.payload[1],  MY_ID);
+  writeU32(&txFrame.payload[5],  target);
+  txFrame.payload[9]  = hop;
+  txFrame.payload[10] = id;
+  writeU32(&txFrame.payload[11], origin);
 
-  myDataSent->length = RADIO_LEN;
+  txFrame.length = RADIO_LEN;
 
-  MicrobitRadio.send(myDataSent);
-  delete myDataSent;
+  MicrobitRadio.send(&txFrame);
 
 #if ENABLE_SERIAL_LOG && LOG_WAVE
   Serial.print("WAVE | send to=");
@@ -584,19 +581,16 @@ void handleReceive(unsigned long _now) {
 }
 
 void sendWaveAck(uint32_t target, uint8_t id, uint32_t origin) {
-  FrameBuffer* ack = new FrameBuffer();
+  memset(txFrame.payload, 0, PAYLOAD_LEN);
+  txFrame.payload[0] = SECRET_WAVE_ACK;
+  writeU32(&txFrame.payload[1],  MY_ID);
+  writeU32(&txFrame.payload[5],  target);
+  txFrame.payload[10] = id;
+  writeU32(&txFrame.payload[11], origin);
 
-  memset(ack->payload, 0, PAYLOAD_LEN);
-  ack->payload[0] = SECRET_WAVE_ACK;
-  writeU32(&ack->payload[1],  MY_ID);
-  writeU32(&ack->payload[5],  target);
-  ack->payload[10] = id;
-  writeU32(&ack->payload[11], origin);
+  txFrame.length = RADIO_LEN;
 
-  ack->length = RADIO_LEN;
-
-  MicrobitRadio.send(ack);
-  delete ack;
+  MicrobitRadio.send(&txFrame);
 
 #if ENABLE_SERIAL_LOG && LOG_WAVE
   Serial.print("WAVE | ack to=");
