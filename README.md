@@ -30,8 +30,33 @@ When a board detects synchronization, it schedules a wave after a short random d
 - [x] **Phase 1:** Two boards exchanging pulses over radio
 - [x] **Phase 2:** Neighbor table with timestamps and RSSI
 - [x] **Phase 3:** Pulse-coupled oscillator and first synchronization
-- [ ] **Phase 4:** Measurement of synchronization time versus number of nodes, distance, and radio power
-- [ ] **Phase 5:** Other behaviors: clusters, repulsive coupling, Kuramoto model (a traveling wave on synchronization is already implemented as a demo)
+- [ ] **Phase 3b:** Stable synchronization: SYNCING/SYNCED states, heartbeat, re-sync triggers, collision-free operation
+- [ ] **Phase 4:** Measurement of synchronization time versus number of nodes, distance, and radio power, including re-sync after join/leave and collision rate
+- [ ] **Phase 5:** Post-sync communication: point-to-point messages between neighbors, wave triggered by button, table used for routing
+- [ ] **Phase 6:** Other behaviors: clusters, repulsive coupling, Kuramoto model (a traveling wave on synchronization is already implemented as a demo)
+
+### Phase 3b
+
+Phase 3 showed that pulse-coupled boards can synchronize. Running the same behavior for longer revealed that the synchronized state was not stable.
+
+**What was observed**
+
+- Once the boards synchronized, they fired within a few milliseconds of each other. The nRF52 radio is half-duplex, so a board transmitting at the same moment as its neighbors cannot hear them. Pulses collided, and the neighbor table emptied for tens of seconds at a time.
+- The neighbor table was not a reliable picture of the swarm. A synchronization event could be declared with fewer nodes than were actually present.
+- Synchronization persisted even with an empty table. Nodes that cannot hear each other stop coupling, and their phases drift only slowly, because of crystal frequency differences. The swarm therefore stayed in step long after the coupling had stopped working, and it re-entered the coupled state only by chance.
+
+**Synchronisation and collision**
+
+The same mechanism that produces synchronization also produces the collisions (How funny :(). Continuous pulsing is what makes the boards align, and it is also what makes them block each other. Jitter on the firing time would reduce the collisions but would not remove the root cause, because the boards would keep pulsing in every cycle.
+
+**What Phase 3b changes**
+
+Discovery and communication are separated into two states:
+
+- **SYNCING:** the board pulses and couples its phase, as in Phase 3. It enters this state at startup, when a neighbor appears or disappears, or when the phase error exceeds a threshold.
+- **SYNCED:** the board stops pulsing on the oscillator. It keeps its neighbor table and sends a slow heartbeat at a randomized interval. Re-entering SYNCING uses hysteresis, so the boards do not oscillate between states.
+
+Once synchronized, each board holds a neighbor table it can trust, and boards communicate with their neighbors without contending for the channel. Phase 4 measures the synchronization behavior of this stable system, so Phase 3b comes before it.
 
 ## Hardware
 
